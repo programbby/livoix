@@ -5,12 +5,34 @@ import re
 import os
 import sys
 from pathlib import Path
+from langdetect import detect, LangDetectException
 
-# Voix françaises disponibles (commente/décommente pour changer)
-VOIX = "fr-FR-DeniseNeural"   # Femme, France (Denise Natural)
-# VOIX = "fr-FR-HenriNeural"  # Homme, France
-# VOIX = "fr-CA-AntoineNeural"  # Homme, Québec
-# VOIX = "fr-CA-SylvieNeural"   # Femme, Québec
+# Voix par défaut par langue détectée (meilleure voix disponible)
+VOIX_PAR_LANGUE = {
+    "fr": "fr-FR-DeniseNeural",
+    "en": "en-US-JennyNeural",
+    "es": "es-ES-ElviraNeural",
+    "de": "de-DE-KatjaNeural",
+    "it": "it-IT-ElsaNeural",
+    "pt": "pt-BR-FranciscaNeural",
+    "nl": "nl-NL-FennaNeural",
+    "pl": "pl-PL-AgnieszkaNeural",
+    "ru": "ru-RU-SvetlanaNeural",
+    "ja": "ja-JP-NanamiNeural",
+    "zh": "zh-CN-XiaoxiaoNeural",
+    "ar": "ar-SA-ZariyahNeural",
+}
+VOIX_DEFAUT = "fr-FR-DeniseNeural"
+
+def detecter_voix(texte):
+    try:
+        langue = detect(texte[:2000])
+        voix = VOIX_PAR_LANGUE.get(langue, VOIX_DEFAUT)
+        print(f"   Langue détectée : {langue} → {voix}")
+        return voix
+    except LangDetectException:
+        print(f"   Langue non détectée → voix par défaut")
+        return VOIX_DEFAUT
 
 def extraire_texte_pdf(chemin_pdf):
     texte = ""
@@ -50,14 +72,14 @@ def nettoyer_texte(texte):
     return texte.strip()
 
 
-async def pdf_vers_audio(chemin_pdf, dossier_sortie, voix=VOIX):
+async def pdf_vers_audio(chemin_pdf, dossier_sortie):
     nom_fichier = Path(chemin_pdf).stem
 
     print(f"\n📖 Lecture du PDF...")
     texte = extraire_texte_pdf(chemin_pdf)
     texte = nettoyer_texte(texte)
     print(f"   {len(texte)} caractères extraits")
-    print(f"   Voix : {voix}")
+    voix = detecter_voix(texte)
     print(f"   Génération en cours (peut prendre quelques minutes)...\n")
 
     fichier_final = os.path.join(dossier_sortie, f"{nom_fichier}.mp3")
