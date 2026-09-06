@@ -9,6 +9,13 @@ import logging
 from pathlib import Path
 from langdetect import detect, LangDetectException, DetectorFactory
 
+# Console Windows : forcer l'UTF-8 (sinon les emojis plantent en cp1252)
+try:
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+except Exception:
+    pass
+
 logging.getLogger("pdfminer").setLevel(logging.ERROR)
 
 DetectorFactory.seed = 0
@@ -138,7 +145,7 @@ if __name__ == "__main__":
         print(f"Erreur : fichier introuvable → {chemin_pdf}")
         sys.exit(1)
 
-    dossier_audio = r"C:\Users\Administrator\OneDrive\Desktop\livres audios"
-    os.makedirs(dossier_audio, exist_ok=True)
+    # Le MP3 est écrit à côté du PDF
+    dossier_audio = str(Path(chemin_pdf).resolve().parent)
 
     asyncio.run(pdf_vers_audio(chemin_pdf, dossier_audio))
