@@ -42,6 +42,7 @@ if not defined chemin (
 set chemin=%chemin:"=%
 
 REM --- UTF-8 seulement maintenant, pour afficher correctement accents et emojis ---
+REM --menu propose la liste des voix francaises ; Entree = detection automatique
 chcp 65001 >nul
-%PY% "%~dp0livoix.py" "%chemin%"
+%PY% "%~dp0livoix.py" "%chemin%" --menu
 pause
