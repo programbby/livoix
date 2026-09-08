@@ -236,7 +236,74 @@ def recoller_lignes(texte):
     return '\n\n'.join(sortie)
 
 
+SYMBOLES_MATHS = '∑∫∏√±≤≥≠∞∈∉⊂⊃∪∩∂∇'
+
+
+def part_repetee(mot):
+    """Part des caractères appartenant à une suite d'au moins 3 identiques.
+
+    Certains PDF dessinent leur filigrane en superposant quatre fois chaque
+    glyphe. À l'extraction ça donne « IIIInnnnssssttttiiiittttuuuutttt », que la
+    voix ânonne lettre par lettre. Le texte normal ne fait jamais ça.
+    """
+    if not mot:
+        return 0.0
+    total = i = 0
+    while i < len(mot):
+        j = i
+        while j + 1 < len(mot) and mot[j + 1] == mot[i]:
+            j += 1
+        longueur = j - i + 1
+        if longueur >= 3:
+            total += longueur
+        i = j + 1
+    return total / len(mot)
+
+
+def mot_est_filigrane(mot):
+    # Cinq caractères minimum : sinon on mangerait les chiffres romains
+    # (III, VIII) qui sont du vrai texte.
+    if len(mot) >= 5 and part_repetee(mot) >= 0.5:
+        return True
+    # Suites de ponctuation répétée laissées par le filigrane : )))) ,,,, ::::
+    if len(mot) >= 3 and part_repetee(mot) == 1.0 and not any(c.isalnum() for c in mot):
+        return True
+    return False
+
+
+def retirer_filigrane(ligne):
+    """Retire les mots au glyphe répété, en gardant le reste de la ligne.
+
+    Le filigrane se retrouve souvent collé à une vraie phrase : jeter la ligne
+    entière ferait perdre du texte du livre.
+    """
+    return ' '.join(m for m in ligne.split() if not mot_est_filigrane(m))
+
+
+def ligne_est_du_bruit(ligne):
+    """Formules mises à plat et suites de symboles : illisibles à voix haute."""
+    nue = ligne.strip()
+    if not nue:
+        return True
+    if any(c in SYMBOLES_MATHS for c in nue):
+        return True
+
+    jetons = nue.split()
+    # Aucun vrai mot dans la ligne : « n n », « I = D D », « i i i i », « =1 i =1 ».
+    # Ce sont les indices et dénominateurs d'une formule, éclatés en lignes.
+    if len(jetons) >= 2 and not any(sum(c.isalpha() for c in j) >= 3 for j in jetons):
+        return True
+
+    if len(jetons) >= 6:
+        isoles = sum(1 for j in jetons if len(j) == 1)
+        if isoles / len(jetons) >= 0.40:
+            return True
+    return False
+
+
 def nettoyer_texte(texte):
+    # Glyphes que l'extracteur n'a pas su décoder (puces en police symbole)
+    texte = re.sub(r'\(cid:\d+\)', '', texte)
     # Réparer les mots coupés en fin de ligne (ex: "impor-\ntant" → "important")
     texte = re.sub(r'-\n([a-zA-ZÀ-ÿ])', r'\1', texte)
 
@@ -257,10 +324,16 @@ def nettoyer_texte(texte):
     texte = re.sub(r'^\s*[•▪◦·]\s*$', '', texte, flags=re.MULTILINE)
     texte = re.sub(r'^\s*[•▪◦·]\s+', '', texte, flags=re.MULTILINE)
 
-    # Lignes sans presque aucune lettre : tableaux, index, suites de chiffres
+    # Filigranes, formules, tableaux : ligne par ligne
     gardees = []
     for ligne in texte.split('\n'):
+        ligne = retirer_filigrane(ligne)
         nue = ligne.strip()
+        if not nue:
+            continue
+        if ligne_est_du_bruit(nue):
+            continue
+        # Lignes sans presque aucune lettre : tableaux, index, suites de chiffres
         if len(nue) >= 8:
             lettres = sum(c.isalpha() or c.isspace() for c in nue)
             if lettres / len(nue) < 0.55:
@@ -274,6 +347,9 @@ def nettoyer_texte(texte):
     # Suites de points ou de tirets qui traînent
     texte = re.sub(r'\.{4,}', '…', texte)
     texte = re.sub(r'[-–—_]{3,}', ' ', texte)
+
+    # Espace manquante après un deux-points ou un point : "Chapitre III :Les..."
+    texte = re.sub(r'([:;,])(?=[A-Za-zÀ-ÿ])', r'\1 ', texte)
 
     texte = re.sub(r' {2,}', ' ', texte)
     texte = re.sub(r'\n{3,}', '\n\n', texte)
