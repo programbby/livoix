@@ -78,8 +78,30 @@ Concrètement :
 
 - La progression affiche le segment en cours et le **temps restant estimé**.
 - Chaque segment est **réessayé jusqu'à 4 fois** avec une attente croissante.
-  Une coupure réseau au segment 180 sur 200 ne fait plus tout perdre.
-- Les fichiers temporaires sont supprimés même si la génération échoue.
+- **La génération reprend où elle s'était arrêtée.** Si tu fermes la fenêtre, si
+  le PC s'éteint ou si ça plante au segment 180 sur 200, relance simplement la
+  même commande : les 180 premiers sont conservés et seuls les suivants sont
+  générés.
+- Les segments sont écrits dans `%TEMP%\livoix\`, **jamais à côté de ton PDF**.
+  Ils sont effacés une fois le MP3 final assemblé.
+- L'assemblage passe par **ffmpeg** s'il est installé, ce qui donne un fichier
+  continu. Sans ffmpeg, les segments sont recollés tels quels et un court blanc
+  reste audible à chaque raccord (environ toutes les 3 minutes). Pour
+  l'installer : `winget install Gyan.FFmpeg`.
+
+## Ce qui est retiré du texte
+
+Un PDF de livre contient beaucoup de choses qui n'ont rien à faire dans un
+audio. Sont détectés et écartés :
+
+- la **page de copyright** (ISBN, mentions légales, adresse de l'éditeur) ;
+- le **sommaire** en entier — sans ça, l'audio commence par plusieurs minutes de
+  « Chapitre 1, Chapitre 2, Chapitre 3… » ;
+- les **en-têtes et pieds de page répétés**, repérés parce qu'ils reviennent sur
+  au moins un quart des pages ;
+- les numéros de page, les URL, les adresses e-mail ;
+- les lignes presque sans lettres : tableaux, index, suites de chiffres ;
+- les puces isolées et les suites de points ou de tirets.
 
 ## Bon à savoir
 

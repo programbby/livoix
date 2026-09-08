@@ -5,7 +5,12 @@ import re
 import os
 import sys
 import time
+import shutil
+import hashlib
 import logging
+import tempfile
+import subprocess
+import collections
 from pathlib import Path
 from langdetect import detect, LangDetectException, DetectorFactory
 
@@ -71,19 +76,131 @@ def detecter_voix(texte):
         return VOIX_DEFAUT
 
 
-def extraire_texte_pdf(chemin_pdf):
-    texte = ""
+def extraire_pages(chemin_pdf):
     try:
         with pdfplumber.open(chemin_pdf) as pdf:
-            for page in pdf.pages:
-                contenu = page.extract_text()
-                if contenu:
-                    texte += contenu + "\n"
+            return [(p.extract_text() or "") for p in pdf.pages]
     except Exception as e:
         print(f"❌ Impossible d'ouvrir le PDF : {e}")
         print("   Si le PDF est protégé par mot de passe, retire la protection d'abord.")
         sys.exit(1)
-    return texte
+
+
+TITRES_SOMMAIRE = ("sommaire", "table des matieres", "table des matières", "contents")
+
+DEBUTS_DE_SECTION = re.compile(
+    r'^(chapitre|annexe|partie|introduction|avant-propos|préface|conclusion|épilogue'
+    r'|première|deuxième|troisième|quatrième|cinquième|sixième|septième|huitième'
+    r'|neuvième|dixième|onzième|douzième)\b',
+    re.IGNORECASE)
+
+
+def est_page_de_garde(texte):
+    """Page de copyright : ISBN, mentions légales, adresse de l'éditeur.
+    Lue à voix haute, ça ne donne que du bruit."""
+    if len(texte) > 1200:
+        return False
+    marqueurs = ('isbn', 'tous droits', 'dépôt légal', 'depot legal', '©',
+                 'all rights reserved', 'imprimé en', 'achevé d\'imprimer')
+    bas = texte.lower()
+    return sum(m in bas for m in marqueurs) >= 2
+
+
+def est_page_de_sommaire(texte):
+    lignes = [l.strip() for l in texte.split('\n') if l.strip()]
+    if not lignes:
+        return False
+    if lignes[0].lower().strip(' :').rstrip('s') in [t.rstrip('s') for t in TITRES_SOMMAIRE]:
+        return True
+    if len(lignes) < 4:
+        return False
+    entrees = sum(
+        bool(DEBUTS_DE_SECTION.match(l) or re.search(r'\.{3,}\s*\d+$', l))
+        for l in lignes)
+    return entrees / len(lignes) >= 0.5
+
+
+def lignes_recurrentes(pages):
+    """Les en-têtes et pieds de page reviennent sur des dizaines de pages.
+    On repère ceux qui apparaissent sur au moins un quart du livre."""
+    if len(pages) < 12:
+        return set()
+    compte = collections.Counter()
+    for t in pages:
+        for l in {x.strip() for x in t.split('\n') if 0 < len(x.strip()) <= 80}:
+            compte[l] += 1
+    seuil = max(4, len(pages) // 4)
+    return {l for l, n in compte.items() if n >= seuil}
+
+
+def assembler_livre(pages, bavard=True):
+    """Enchaîne les pages en retirant ce qui n'a pas à être lu."""
+    recurrentes = lignes_recurrentes(pages)
+    retires = {'garde': 0, 'sommaire': 0, 'recurrentes': 0}
+
+    debut = 0
+    dans_le_sommaire = False
+    for i, texte in enumerate(pages):
+        # Les pages blanches du début ne doivent pas arrêter l'inspection :
+        # la page de copyright arrive souvent après une ou deux d'entre elles.
+        if not texte.strip():
+            debut = i + 1
+            continue
+        if est_page_de_garde(texte):
+            retires['garde'] += 1
+            debut = i + 1
+            continue
+        if est_page_de_sommaire(texte):
+            dans_le_sommaire = True
+            retires['sommaire'] += 1
+            debut = i + 1
+            continue
+        if dans_le_sommaire:
+            # Le sommaire déborde souvent sur des pages courtes ou presque vides.
+            if len(texte.strip()) < 250:
+                retires['sommaire'] += 1
+                debut = i + 1
+                continue
+            dans_le_sommaire = False
+        break
+
+    morceaux = []
+    sommaire_precedent = False
+    for texte in pages[debut:]:
+        if not texte.strip():
+            continue
+        if est_page_de_sommaire(texte):
+            retires['sommaire'] += 1
+            sommaire_precedent = True
+            continue
+        # Un sommaire se termine presque toujours par une page très courte
+        # (les dernières annexes). Elle suit une page de sommaire : on la retire.
+        if sommaire_precedent and len(texte.strip()) < 250:
+            retires['sommaire'] += 1
+            continue
+        sommaire_precedent = False
+        if recurrentes:
+            gardees = []
+            for l in texte.split('\n'):
+                if l.strip() in recurrentes:
+                    retires['recurrentes'] += 1
+                else:
+                    gardees.append(l)
+            texte = '\n'.join(gardees)
+        morceaux.append(texte)
+
+    if bavard:
+        details = []
+        if retires['garde']:
+            details.append(f"{retires['garde']} page(s) de copyright")
+        if retires['sommaire']:
+            details.append(f"{retires['sommaire']} page(s) de sommaire")
+        if retires['recurrentes']:
+            details.append(f"{retires['recurrentes']} en-tête(s)/pied(s) répétés")
+        if details:
+            print("   Retiré : " + ", ".join(details))
+
+    return "\n".join(morceaux)
 
 
 def recoller_lignes(texte):
@@ -123,8 +240,11 @@ def nettoyer_texte(texte):
     # Réparer les mots coupés en fin de ligne (ex: "impor-\ntant" → "important")
     texte = re.sub(r'-\n([a-zA-ZÀ-ÿ])', r'\1', texte)
 
+    # Adresses, URL et ISBN : illisibles à voix haute
     texte = re.sub(r'https?://\S+', '', texte)
     texte = re.sub(r'www\.\S+', '', texte)
+    texte = re.sub(r'\S+@\S+\.\w+', '', texte)
+    texte = re.sub(r'^.*\bISBN\b.*$', '', texte, flags=re.MULTILINE | re.IGNORECASE)
 
     # Lignes de sommaire : de vrais points de remplissage suivis d'un numéro
     texte = re.sub(r'^.{1,80}\.{4,}\s*\d+\s*$', '', texte, flags=re.MULTILINE)
@@ -133,8 +253,27 @@ def nettoyer_texte(texte):
     texte = re.sub(r'^\s*[-–]?\s*\d+\s*[-–]?\s*$', '', texte, flags=re.MULTILINE)
     texte = re.sub(r'^\s*[Pp]age\s+\d+.*$', '', texte, flags=re.MULTILINE)
 
+    # Puces isolées sur leur propre ligne : rien à prononcer
+    texte = re.sub(r'^\s*[•▪◦·]\s*$', '', texte, flags=re.MULTILINE)
+    texte = re.sub(r'^\s*[•▪◦·]\s+', '', texte, flags=re.MULTILINE)
+
+    # Lignes sans presque aucune lettre : tableaux, index, suites de chiffres
+    gardees = []
+    for ligne in texte.split('\n'):
+        nue = ligne.strip()
+        if len(nue) >= 8:
+            lettres = sum(c.isalpha() or c.isspace() for c in nue)
+            if lettres / len(nue) < 0.55:
+                continue
+        gardees.append(ligne)
+    texte = '\n'.join(gardees)
+
     # Recoller les lignes brisées par la mise en page
     texte = recoller_lignes(texte)
+
+    # Suites de points ou de tirets qui traînent
+    texte = re.sub(r'\.{4,}', '…', texte)
+    texte = re.sub(r'[-–—_]{3,}', ' ', texte)
 
     texte = re.sub(r' {2,}', ' ', texte)
     texte = re.sub(r'\n{3,}', '\n\n', texte)
@@ -194,6 +333,59 @@ async def generer_chunk(texte, fichier_sortie, voix, debit):
     raise RuntimeError(f"segment abandonné après {TENTATIVES} tentatives : {derniere}")
 
 
+def dossier_travail(chemin_pdf, voix, debit):
+    """Un sous-dossier de %TEMP% propre à ce PDF, cette voix et ce débit.
+
+    Les segments y survivent entre deux lancements : si la génération est
+    interrompue, la suivante reprend là où elle s'était arrêtée.
+    """
+    cle = f"{os.path.abspath(chemin_pdf)}|{voix}|{debit}"
+    empreinte = hashlib.sha1(cle.encode()).hexdigest()[:10]
+    chemin = os.path.join(tempfile.gettempdir(), "livoix", empreinte)
+    os.makedirs(chemin, exist_ok=True)
+    return chemin
+
+
+def trouver_ffmpeg():
+    """ffmpeg supprime les silences de jointure entre les segments.
+    Sans lui on recolle les octets, ce qui laisse un blanc à chaque raccord."""
+    chemin = shutil.which("ffmpeg")
+    if chemin:
+        return chemin
+    # winget installe parfois hors du PATH de la session en cours
+    base = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Microsoft", "WinGet", "Packages")
+    if os.path.isdir(base):
+        for racine, _, fichiers in os.walk(base):
+            if "ffmpeg.exe" in fichiers:
+                return os.path.join(racine, "ffmpeg.exe")
+    return None
+
+
+def assembler(fichiers, fichier_final, ffmpeg):
+    """Recolle les segments en un seul MP3 continu."""
+    if ffmpeg:
+        liste = os.path.join(os.path.dirname(fichiers[0]), "liste.txt")
+        with open(liste, "w", encoding="utf-8") as f:
+            for chemin in fichiers:
+                f.write("file '" + chemin.replace("\\", "/").replace("'", "'\\''") + "'\n")
+        commande = [
+            ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+            "-f", "concat", "-safe", "0", "-i", liste,
+            "-c:a", "libmp3lame", "-b:a", "48k", "-ar", "24000", "-ac", "1",
+            fichier_final,
+        ]
+        resultat = subprocess.run(commande, capture_output=True, text=True)
+        if resultat.returncode == 0 and os.path.getsize(fichier_final) > 0:
+            return True
+        print(f"\n   ⚠ ffmpeg a échoué, recollage simple : {resultat.stderr.strip()[:200]}")
+
+    with open(fichier_final, "wb") as sortie:
+        for chemin in fichiers:
+            with open(chemin, "rb") as partie:
+                sortie.write(partie.read())
+    return False
+
+
 def duree_lisible(secondes):
     secondes = int(secondes)
     if secondes < 60:
@@ -205,7 +397,9 @@ async def pdf_vers_audio(chemin_pdf, dossier_sortie, voix=None, debit="+0%"):
     nom_fichier = Path(chemin_pdf).stem
 
     print("\n📖 Lecture du PDF...")
-    texte = nettoyer_texte(extraire_texte_pdf(chemin_pdf))
+    pages = extraire_pages(chemin_pdf)
+    print(f"   {len(pages)} pages")
+    texte = nettoyer_texte(assembler_livre(pages))
 
     if not texte or len(texte) < 20:
         print("❌ Aucun texte extractible du PDF (probablement un scan/image).")
@@ -228,29 +422,39 @@ async def pdf_vers_audio(chemin_pdf, dossier_sortie, voix=None, debit="+0%"):
     print(f"   Découpé en {len(chunks)} segments")
     print(f"   Voix : {voix}   Débit : {debit}\n")
 
-    depart = time.time()
-    fichiers_temp = []
-    try:
-        for i, chunk in enumerate(chunks):
-            fichier_temp = os.path.join(dossier_sortie, f"_temp_{i:04d}.mp3")
-            reste = ((time.time() - depart) / i * (len(chunks) - i)) if i else 0
-            eta = f"   reste ~{duree_lisible(reste)}" if i else ""
-            print(f"🔊 Segment {i + 1}/{len(chunks)}{eta}          ", end="\r")
-            await generer_chunk(chunk, fichier_temp, voix, debit)
-            fichiers_temp.append(fichier_temp)
+    # Les segments intermédiaires vont dans %TEMP%, jamais à côté du PDF : sur un
+    # gros livre ce sont des centaines de fichiers, et les voir apparaître dans
+    # son dossier donne envie de les supprimer — ce qui casse l'assemblage.
+    dossier_temp = dossier_travail(chemin_pdf, voix, debit)
 
-        print("\n🔗 Assemblage du fichier final...")
-        with open(fichier_final, 'wb') as sortie:
-            for f in fichiers_temp:
-                with open(f, 'rb') as partie:
-                    sortie.write(partie.read())
-    finally:
-        # Même en cas d'échec, on ne laisse pas des dizaines de _temp_ derrière.
-        for f in fichiers_temp:
-            try:
-                os.remove(f)
-            except OSError:
-                pass
+    fichiers_temp = [os.path.join(dossier_temp, f"segment_{i:04d}.mp3")
+                     for i in range(len(chunks))]
+    deja_faits = sum(1 for f in fichiers_temp
+                     if os.path.exists(f) and os.path.getsize(f) > 0)
+    if deja_faits:
+        print(f"   Reprise : {deja_faits} segment(s) déjà générés, on continue\n")
+
+    depart = time.time()
+    faits_ici = 0
+    for i, chunk in enumerate(chunks):
+        fichier_temp = fichiers_temp[i]
+        if os.path.exists(fichier_temp) and os.path.getsize(fichier_temp) > 0:
+            continue
+        reste = ((time.time() - depart) / faits_ici *
+                 (len(chunks) - i)) if faits_ici else 0
+        eta = f"   reste ~{duree_lisible(reste)}" if faits_ici else ""
+        print(f"🔊 Segment {i + 1}/{len(chunks)}{eta}          ", end="\r")
+        await generer_chunk(chunk, fichier_temp, voix, debit)
+        faits_ici += 1
+
+    print("\n🔗 Assemblage du fichier final...")
+    continu = assembler(fichiers_temp, fichier_final, trouver_ffmpeg())
+    if not continu:
+        print("   (ffmpeg introuvable : de courts blancs subsistent aux raccords)")
+
+    # Seulement une fois le fichier final écrit : si on échoue avant, les
+    # segments restent et le prochain lancement reprend où on en était.
+    shutil.rmtree(dossier_temp, ignore_errors=True)
 
     taille_mb = os.path.getsize(fichier_final) / (1024 * 1024)
     print(f"✅ Terminé en {duree_lisible(time.time() - depart)}")
